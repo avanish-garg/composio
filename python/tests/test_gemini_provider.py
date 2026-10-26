@@ -9,8 +9,10 @@ Verifies:
 - _process_execution_result helper
 """
 
+import functools
 import inspect
-from unittest.mock import MagicMock, Mock
+import warnings
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -887,6 +889,170 @@ class TestHandleResponse:
         execute_tool.assert_called_once_with(
             slug="VALIDATE_SOURCE_SCHEMA", arguments={"value": 3}
         )
+
+    @staticmethod
+    def _bind_user(execute_tool, user_id):
+        """Bind a caller the way ``Tools`` does for every ``get()``."""
+        return functools.partial(execute_tool, user_id=user_id, modifiers=None)
+
+    def test_tools_argument_runs_call_as_the_user_that_fetched_them(self):
+        """Two users fetch the same tool; each response runs as its own user."""
+        from composio_gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        tool = create_mock_tool("GMAIL_FETCH_EMAILS", "gmail")
+        execute = create_mock_execute_tool()
+        alice_tools = provider.wrap_tools([tool], self._bind_user(execute, "alice"))
+        bob_tools = provider.wrap_tools([tool], self._bind_user(execute, "bob"))
+        response = self._create_mock_response([("GMAIL_FETCH_EMAILS", {})])
+
+        _, executed = provider.handle_response(response, tools=alice_tools)
+        assert executed is True
+        assert execute.call_args.kwargs["user_id"] == "alice"
+
+        provider.handle_response(response, tools=bob_tools)
+        assert execute.call_args.kwargs["user_id"] == "bob"
+
+        provider.handle_response(response, tools=alice_tools)
+        assert execute.call_args.kwargs["user_id"] == "alice"
+        assert execute.call_count == 3
+
+    def test_tools_argument_skips_calls_for_tools_not_passed(self):
+        """A call is never executed through another caller's registry entry."""
+        from composio_gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        execute = create_mock_execute_tool()
+        mail = provider.wrap_tools(
+            [create_mock_tool("GMAIL_FETCH_EMAILS", "gmail")],
+            self._bind_user(execute, "alice"),
+        )
+        provider.wrap_tools(
+            [create_mock_tool("GITHUB_STAR_REPO", "github")],
+            self._bind_user(execute, "bob"),
+        )
+        response = self._create_mock_response([("GITHUB_STAR_REPO", {})])
+
+        function_responses, executed = provider.handle_response(response, tools=mail)
+
+        assert executed is False
+        assert function_responses == []
+        execute.assert_not_called()
+
+    def test_tools_argument_ignores_callables_not_wrapped_by_composio(self):
+        from composio_gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        response = self._create_mock_response([("GMAIL_FETCH_EMAILS", {})])
+
+        def unrelated():
+            """Not a Composio tool."""
+
+        _, executed = provider.handle_response(response, tools=[unrelated])
+        assert executed is False
+
+    def test_tools_argument_matches_each_call_by_name(self):
+        """A response with calls to tools from different fetches uses each one's own."""
+        from composio_gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        execute = create_mock_execute_tool()
+        mail = provider.wrap_tools(
+            [create_mock_tool("GMAIL_FETCH_EMAILS", "gmail")],
+            self._bind_user(execute, "alice"),
+        )
+        repo = provider.wrap_tools(
+            [create_mock_tool("GITHUB_STAR_REPO", "github")],
+            self._bind_user(execute, "bob"),
+        )
+        response = self._create_mock_response(
+            [("GMAIL_FETCH_EMAILS", {}), ("GITHUB_STAR_REPO", {})]
+        )
+
+        provider.handle_response(response, tools=[*mail, *repo])
+
+        assert [c.kwargs["user_id"] for c in execute.call_args_list] == [
+            "alice",
+            "bob",
+        ]
+
+    def test_without_tools_single_user_keeps_working_without_warning(self):
+        """The no-argument call stays as it was for one user, even across get() calls."""
+        from composio_gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        tool = create_mock_tool("GMAIL_FETCH_EMAILS", "gmail")
+        execute = create_mock_execute_tool()
+        provider.wrap_tools([tool], self._bind_user(execute, "alice"))
+        provider.wrap_tools([tool], self._bind_user(execute, "alice"))
+        response = self._create_mock_response([("GMAIL_FETCH_EMAILS", {})])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _, executed = provider.handle_response(response)
+
+        assert executed is True
+        assert execute.call_args.kwargs["user_id"] == "alice"
+
+    def test_without_tools_warns_when_slug_was_wrapped_for_two_users(self):
+        """The registry fallback still picks the last user, but says it is ambiguous."""
+        from composio_gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        tool = create_mock_tool("GMAIL_FETCH_EMAILS", "gmail")
+        execute = create_mock_execute_tool()
+        provider.wrap_tools([tool], self._bind_user(execute, "alice"))
+        provider.wrap_tools([tool], self._bind_user(execute, "bob"))
+        response = self._create_mock_response([("GMAIL_FETCH_EMAILS", {})])
+
+        with pytest.warns(UserWarning, match="GMAIL_FETCH_EMAILS.*tools=tools"):
+            _, executed = provider.handle_response(response)
+
+        assert executed is True
+        assert execute.call_args.kwargs["user_id"] == "bob"
+
+    def test_tools_argument_does_not_warn_for_two_users(self):
+        from composio_gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        tool = create_mock_tool("GMAIL_FETCH_EMAILS", "gmail")
+        execute = create_mock_execute_tool()
+        alice_tools = provider.wrap_tools([tool], self._bind_user(execute, "alice"))
+        provider.wrap_tools([tool], self._bind_user(execute, "bob"))
+        response = self._create_mock_response([("GMAIL_FETCH_EMAILS", {})])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            provider.handle_response(response, tools=alice_tools)
+
+    def test_tools_get_for_two_users_runs_each_response_as_its_user(self):
+        """End to end through ``Tools``: ``user_id`` reaches ``execute`` per user."""
+        from composio_gemini import GeminiProvider
+
+        from composio.core.models.tools import Tools
+        from tests.conftest import mock_http_client
+
+        provider = GeminiProvider()
+        tools = Tools(client=mock_http_client(), provider=provider)
+        tool = create_mock_tool("GMAIL_FETCH_EMAILS", "gmail")
+        response = self._create_mock_response([("GMAIL_FETCH_EMAILS", {})])
+
+        with (
+            patch.object(tools, "get_raw_composio_tools", return_value=[tool]),
+            patch.object(tools, "execute", return_value={"data": {}}) as execute,
+        ):
+            alice_tools = tools.get(user_id="alice", tools=["GMAIL_FETCH_EMAILS"])
+            bob_tools = tools.get(user_id="bob", tools=["GMAIL_FETCH_EMAILS"])
+
+            provider.handle_response(response, tools=alice_tools)
+            assert execute.call_args.kwargs["user_id"] == "alice"
+
+            provider.handle_response(response, tools=bob_tools)
+            assert execute.call_args.kwargs["user_id"] == "bob"
+
+            # The AFC callable already ran as its own user and still does.
+            alice_tools[0]()
+            assert execute.call_args.kwargs["user_id"] == "alice"
 
     def test_no_function_calls(self):
         from composio_gemini import GeminiProvider

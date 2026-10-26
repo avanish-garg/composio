@@ -36,7 +36,7 @@ response = chat.send_message(
 print(response.text)
 ```
 
-If you disable Automatic Function Calling and handle function calls yourself, `composio.provider.handle_response(response)` executes the function calls in a Gemini response and returns `Part` objects ready to send back.
+If you disable Automatic Function Calling and handle function calls yourself, `composio.provider.handle_response(response, tools=tools)` executes the function calls in a Gemini response and returns `Part` objects ready to send back. Pass the same `tools` you gave `GenerateContentConfig`: each call then runs for the user or Session those tools were fetched for, even when one `Composio` instance serves several users. Without `tools`, the call runs for whoever fetched that tool most recently, and the provider warns if more than one user did.
 
 ## composio-gemini vs composio-google
 

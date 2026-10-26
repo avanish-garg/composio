@@ -5,8 +5,10 @@ Calling (AFC). The SDK can introspect the callable's signature to derive
 FunctionDeclaration schemas and auto-execute tool calls in the chat loop.
 """
 
+import functools
 import types as pytypes
 import typing as t
+import warnings
 from inspect import Parameter, Signature
 
 from pydantic import BaseModel
@@ -31,6 +33,32 @@ try:
 except ImportError:
     genai_types = None  # type: ignore
     HAS_GENAI = False
+
+
+# What ``wrap_tool`` keeps for ``handle_response``: the executor bound to the
+# ``tools.get()`` / ``session.tools()`` call that produced the callable, plus the
+# schema pieces needed to validate the model's arguments the way AFC does.
+_Executor = t.Tuple[AgenticProviderExecuteFn, ToolSchemaAliases, t.Type[BaseModel]]
+
+# Attribute that carries a callable's own ``_Executor``, so ``handle_response``
+# can run a call through the exact tools that were offered to the model.
+_EXECUTOR_ATTR = "__composio_executor__"
+
+# What ``Tools`` binds into every execute function it hands to ``wrap_tool``.
+_CALLER_KEYS = ("user_id", "modifiers")
+
+
+def _same_executor(a: t.Any, b: t.Any) -> bool:
+    """Whether two execute functions would run a tool for the same caller.
+
+    ``Tools`` binds ``user_id`` and ``modifiers`` into a new ``functools.partial``
+    on every ``get()``, so compare those instead of identity: the same user
+    fetching tools again is not a different caller. Anything else (for example
+    the Tool Router session executor) is compared by equality.
+    """
+    if isinstance(a, functools.partial) and isinstance(b, functools.partial):
+        return all(a.keywords.get(key) == b.keywords.get(key) for key in _CALLER_KEYS)
+    return bool(a == b)
 
 
 def _to_serializable(value: t.Any) -> t.Any:
@@ -138,10 +166,12 @@ class GeminiProvider(AgenticProvider[t.Callable, list[t.Callable]], name="gemini
 
     def __init__(self, **kwargs: t.Any):
         super().__init__(**kwargs)
-        self._executors: t.Dict[
-            str,
-            t.Tuple[AgenticProviderExecuteFn, ToolSchemaAliases, t.Type[BaseModel]],
-        ] = {}
+        # Last executor wrapped for each slug. Only ``handle_response(response)``
+        # without ``tools`` reads it, so it cannot tell callers apart.
+        self._executors: t.Dict[str, _Executor] = {}
+        # Slugs wrapped for more than one caller since, so the registry above is
+        # ambiguous for them.
+        self._ambiguous_slugs: t.Set[str] = set()
 
     def wrap_tool(
         self,
@@ -161,7 +191,11 @@ class GeminiProvider(AgenticProvider[t.Callable, list[t.Callable]], name="gemini
         # validation model needs them: without a default every optional field
         # would be required.
         args_schema = json_schema_to_model(aliases.schema, skip_default=False)
-        self._executors[tool.slug] = (execute_tool, aliases, args_schema)
+        executor: _Executor = (execute_tool, aliases, args_schema)
+        previous = self._executors.get(tool.slug)
+        if previous is not None and not _same_executor(previous[0], execute_tool):
+            self._ambiguous_slugs.add(tool.slug)
+        self._executors[tool.slug] = executor
 
         def function(**kwargs: t.Any) -> t.Dict:
             """Composio tool execution wrapper."""
@@ -209,6 +243,7 @@ class GeminiProvider(AgenticProvider[t.Callable, list[t.Callable]], name="gemini
                 annotations[param.name] = param.annotation
         annotations["return"] = dict
         action_func.__annotations__ = annotations
+        setattr(action_func, _EXECUTOR_ATTR, executor)
 
         return action_func
 
@@ -222,13 +257,31 @@ class GeminiProvider(AgenticProvider[t.Callable, list[t.Callable]], name="gemini
 
     # --- Backward compatibility: manual function calling ---
 
-    def handle_response(self, response: t.Any) -> tuple[list, bool]:
+    def handle_response(
+        self,
+        response: t.Any,
+        tools: t.Optional[t.Sequence[t.Callable]] = None,
+    ) -> tuple[list, bool]:
         """Manually handle function calls in a Gemini response.
 
         Provided for backward compatibility with code that uses manual function
         calling instead of AFC. For new code, pass the callables from
         ``wrap_tools()`` to ``GenerateContentConfig(tools=...)`` and AFC will
         handle execution automatically.
+
+        A response does not say whose tools produced it. Pass the callables the
+        request was made with as ``tools`` and each function call runs as the
+        user (or Tool Router session) those tools were fetched for. Without
+        ``tools`` the provider falls back to the executor of the most recent
+        ``wrap_tools()`` call for each function name, which is the wrong user
+        when one ``Composio`` instance fetches tools for several users; that
+        case emits a warning.
+
+        Args:
+            response: The ``GenerateContentResponse`` to read function calls from.
+            tools: The callables returned by ``composio.tools.get(...)`` or
+                ``session.tools()`` for this conversation. Function calls that
+                match none of them are skipped.
 
         Returns:
             tuple: ``(function_responses, executed)`` where *function_responses*
@@ -245,6 +298,16 @@ class GeminiProvider(AgenticProvider[t.Callable, list[t.Callable]], name="gemini
         if not (hasattr(candidate, "content") and candidate.content.parts):
             return [], False
 
+        executors: t.Mapping[str, _Executor]
+        if tools is None:
+            executors = self._executors
+        else:
+            executors = {}
+            for tool in tools:
+                executor = getattr(tool, _EXECUTOR_ATTR, None)
+                if executor is not None:
+                    executors[tool.__name__] = executor
+
         function_responses: list = []
         executed = False
 
@@ -253,11 +316,23 @@ class GeminiProvider(AgenticProvider[t.Callable, list[t.Callable]], name="gemini
                 continue
 
             fc = part.function_call
-            if fc.name not in self._executors:
+            if fc.name not in executors:
                 continue
 
+            if tools is None and fc.name in self._ambiguous_slugs:
+                warnings.warn(
+                    f"GeminiProvider.handle_response() ran {fc.name!r} with the "
+                    "most recent composio.tools.get() / session.tools() call "
+                    "that wrapped it, but that tool was wrapped for more than "
+                    "one user or session, so this may not be the one that "
+                    "produced the response. Pass the tools the response was "
+                    "generated with: handle_response(response, tools=tools).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
             # Same validate -> serialize -> alias sequence as the AFC callable.
-            execute_tool, aliases, args_schema = self._executors[fc.name]
+            execute_tool, aliases, args_schema = executors[fc.name]
             arguments = validate_and_serialize_tool_arguments(
                 args_schema,
                 normalize_tool_arguments(_to_serializable(dict(fc.args))),
